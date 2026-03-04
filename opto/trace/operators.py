@@ -606,5 +606,57 @@ def call_llm(llm, system_prompt: str, *user_prompts, **kwargs) -> str:
     for user_prompt in user_prompts:
         messages.append({"role": "user", "content": user_prompt})
     # TODO auto-parsing results
-    response = llm(messages=messages, **kwargs)
-    return response.choices[0].message.content
+
+    try:
+        from opto.trace.io.telemetry_session import TelemetrySession
+        sess = TelemetrySession.current()
+    except Exception:
+        sess = None
+
+    if sess is None or not getattr(sess, "record_spans", False):
+        response = llm(messages=messages, **kwargs)
+        return response.choices[0].message.content
+
+    try:
+        from opto.trace.io.otel_semconv import record_genai_chat
+    except Exception:
+        record_genai_chat = None  # type: ignore
+
+    provider = getattr(llm, "provider_name", None) or getattr(llm, "provider", None) or "litellm"
+    model = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "llm"
+
+    with sess.tracer.start_as_current_span("llm") as sp:
+        sp.set_attribute("trace.temporal_ignore", "true")
+        sp.set_attribute("gen_ai.provider.name", str(provider))
+        sp.set_attribute("gen_ai.request.model", str(model))
+
+        try:
+            response = llm(messages=messages, **kwargs)
+        except Exception as e:
+            try:
+                sp.record_exception(e)
+                sp.set_attribute("error.type", type(e).__name__)
+                sp.set_attribute("error.message", str(e)[:500])
+            except Exception:
+                pass
+            raise
+
+        if record_genai_chat is not None:
+            try:
+                out_msg = None
+                try:
+                    out_msg = response.choices[0].message.content
+                except Exception:
+                    out_msg = None
+
+                record_genai_chat(
+                    sp,
+                    provider=str(provider),
+                    model=str(model),
+                    input_messages=messages,
+                    output_text=out_msg,
+                )
+            except Exception:
+                pass
+
+        return response.choices[0].message.content
